@@ -3,6 +3,11 @@
 A backend that other applications call to decide whether one of *their* users may consume N units, and to record the outcome.
 TypeScript · Fastify · PostgreSQL (plain SQL via `pg`). One service, one database.
 
+## Requirements
+
+- **Docker** with Docker Compose v2 (Docker Desktop on Windows/macOS) to run the full stack.
+- **Node.js 20+** only if you want to run the tests or the load test from your machine (`npm install` first).
+
 ## Run it
 
 ```bash
@@ -15,11 +20,26 @@ docker compose up --build
 | Quota service API | http://localhost:3000 |
 | PostgreSQL | localhost:5432 (user/password/db: `quota`) |
 
-On the client page: **1. Setup demo account**, then **2. Run scripted demo**. The demo shows, in order: an accepted action, a rejection by a *user* limit, a rejection by the shared *account* limit, a user plan switch, and an account plan edit changing what a user can do, with no client change and no redeploy. You can also process documents manually and switch plans from the page. Headless: `curl -X POST localhost:8080/api/demo`.
+On the client page: **1. Setup demo account**, then **2. Run scripted demo**. The demo shows, in order: an accepted action, a rejection by a *user* limit, a rejection by the shared *account* limit, a user plan switch, and an account plan edit changing what a user can do, with no client change and no redeploy. You can also process documents manually and switch plans from the page. Headless: `curl -X POST localhost:8080/api/demo` (PowerShell: `curl.exe -X POST localhost:8080/api/demo`).
 
 Schema creation and predefined-plan seeding run automatically on service start (`db/init.sql`, idempotent).
 
 Config (env): `DATABASE_URL`, `PORT` (3000), `ADMIN_TOKEN` (if set, creating accounts requires header `x-admin-token`; compose sets `dev-admin-token`), `PG_POOL_MAX` (20), `LOG_LEVEL`.
+`dev-admin-token` is a development default only: change it (in `docker-compose.yml`) for any real deployment.
+
+**Data persistence:** data lives in the `pgdata` Docker volume, so it survives `docker compose down` and restarts. `docker compose down -v` deletes it (fresh start).
+
+## Project layout
+
+```
+src/app.ts            all routes; /consume is the core
+src/db.ts, index.ts   pool, migration runner, startup
+db/init.sql           schema + predefined plans (idempotent, runs on every start)
+test/service.test.ts  integration tests (real PostgreSQL)
+scripts/load.mjs      load test (autocannon) + correctness check
+client/               example application (web page + small backend that holds the API key)
+docs/LOAD_TEST.md     performance results and analysis
+```
 
 ## Concepts
 
@@ -65,6 +85,14 @@ curl -s -X POST localhost:3000/users -H "x-api-key: $KEY" -H 'content-type: appl
 curl -s -X POST localhost:3000/consume -H "x-api-key: $KEY" -H 'content-type: application/json' \
      -d '{"userId":"alice","units":25,"requestId":"doc-123"}'
 ```
+PowerShell (Windows):
+```powershell
+$acc = Invoke-RestMethod -Method Post -Uri http://localhost:3000/accounts -Headers @{"x-admin-token"="dev-admin-token"} -ContentType "application/json" -Body '{"name":"Acme"}'
+$h = @{"x-api-key"=$acc.apiKey}
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/users -Headers $h -ContentType "application/json" -Body '{"userId":"alice"}'
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/consume -Headers $h -ContentType "application/json" -Body '{"userId":"alice","units":25,"requestId":"doc-123"}'
+```
+Example `/consume` response (a rejection):
 ```json
 { "requestId":"doc-123","userId":"alice","units":25,"month":"2026-03","accepted":false,"replayed":false,
   "rejection":{"scope":"user","rule":"max_per_request","message":"User per-request limit would be exceeded"},
@@ -78,7 +106,7 @@ curl -s -X POST localhost:3000/consume -H "x-api-key: $KEY" -H 'content-type: ap
 Both plans must allow the request. Checks, in order (order only affects *which* violated rule is reported): user per-request, account per-request, user monthly, account monthly. Accepted ⇒ +units on the user **and** the account (account usage = sum of its users'). Rejected ⇒ nothing consumed. Month = UTC month at processing time. Remaining = `max(0, allowance − consumed)`.
 
 ### Plan changes
-Plans are read inside each `/consume` transaction, so an edit applies to every request that arrives after the edit commits. Switching a plan keeps units already consumed (no fresh allowance). Lowering an allowance below current usage ⇒ remaining 0 and rejections until the allowance is raised or the month rolls over. History rows are never rewritten.
+Plans are read inside each `/consume` transaction, so an edit applies to every request that arrives after the edit commits (a request already in progress, e.g. waiting for a row lock, may still be decided with the plan it read when it started). Switching a plan keeps units already consumed (no fresh allowance). Lowering an allowance below current usage ⇒ remaining 0 and rejections until the allowance is raised or the month rolls over. History rows are never rewritten.
 
 ### Retries / idempotency
 `requestId` is unique per account. Same `requestId` + same user/units ⇒ the **stored decision is replayed** (`replayed:true`), consuming nothing again, including when duplicates arrive concurrently (the second blocks on the unique index until the first commits). Same `requestId` with different user/units ⇒ `409 request_id_conflict`. Invalid requests (400/404/401) are not recorded and consume nothing, so they can be retried freely.
@@ -119,9 +147,14 @@ Covers: API-key validation, admin token, account isolation (usage, history, plan
 ```bash
 docker compose up -d --build         # service on :3000
 npm install
-ADMIN_TOKEN=dev-admin-token npm run load     # DURATION=10 CONNECTIONS=64 by default
+ADMIN_TOKEN=dev-admin-token npm run load     # macOS/Linux; DURATION=10 CONNECTIONS=64 by default
 ```
-Uses `autocannon` (`scripts/load.mjs`). Scenarios: one hot account with 200 users, 50 accounts spread out, and a correctness run where limits are really hit and the final counters are checked against an independent re-sum of the request history. Results and analysis: [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
+```powershell
+docker compose up -d --build
+npm install
+$env:ADMIN_TOKEN="dev-admin-token"; npm run load      # Windows PowerShell
+```
+Uses `autocannon` (`scripts/load.mjs`). Scenarios: one hot account with 200 users, 50 accounts spread out, and a correctness run where limits are really hit and the final counters are checked against an independent re-sum of the request history. Results and analysis: [docs/LOAD_TEST.md](docs/LOAD_TEST.md). In short: a single hot account is limited by lock-hold time (~100 req/s on a Docker Desktop laptop), many accounts run ~4x faster, and under load the counters always matched the request history exactly (no overspend).
 
 ## Known limitations
 
