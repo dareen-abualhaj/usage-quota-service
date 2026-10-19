@@ -22,6 +22,13 @@ docker compose up --build
 
 On the client page: **1. Setup demo account**, then **2. Run scripted demo**. The demo shows, in order: an accepted action, a rejection by a *user* limit, a rejection by the shared *account* limit, a user plan switch, and an account plan edit changing what a user can do, with no client change and no redeploy. You can also process documents manually and switch plans from the page. Headless: `curl -X POST localhost:8080/api/demo` (PowerShell: `curl.exe -X POST localhost:8080/api/demo`).
 
+Screenshots of the demo (user limit, shared account limit, plan switch):
+
+![Rejected by the user's per-request limit](docs/demo-user-limit.png)
+![Shared account allowance (1 of 2)](docs/demo-account-limit1.png)
+![Rejected by the shared account allowance (2 of 2)](docs/demo-account-limit2.png)
+![After switching the plan, the same action is accepted](docs/demo-plan-switch.png)
+
 Schema creation and predefined-plan seeding run automatically on service start (`db/init.sql`, idempotent).
 
 Config (env): `DATABASE_URL`, `PORT` (3000), `ADMIN_TOKEN` (if set, creating accounts requires header `x-admin-token`; compose sets `dev-admin-token`), `PG_POOL_MAX` (20), `LOG_LEVEL`.
@@ -32,13 +39,20 @@ Config (env): `DATABASE_URL`, `PORT` (3000), `ADMIN_TOKEN` (if set, creating acc
 ## Project layout
 
 ```
-src/app.ts            all routes; /consume is the core
-src/db.ts, index.ts   pool, migration runner, startup
-db/init.sql           schema + predefined plans (idempotent, runs on every start)
-test/service.test.ts  integration tests (real PostgreSQL)
-scripts/load.mjs      load test (autocannon) + correctness check
-client/               example application (web page + small backend that holds the API key)
-docs/LOAD_TEST.md     performance results and analysis
+src/routes/*.ts            HTTP only: authenticate, validate, call a service, shape the response
+src/services/consume.ts    THE ACCOUNTING: the transaction that decides and records a request
+src/rules.ts               THE RULES: pure functions (evaluate), no database / HTTP
+src/services/auth.ts       API key hashing, key generation, cached authentication
+src/services/lookup.ts     account-scoped reads (plans, users, usage) shared by routes
+src/views.ts, errors.ts, validation.ts, types.ts   response shapes, error type, input checks, shared types
+src/app.ts                 builds the Fastify app (no server), error handler, registers routes
+src/db.ts, src/index.ts    pool, migration runner, startup
+db/init.sql                schema + predefined plans (idempotent, runs on every start)
+test/                      rules.test.ts (unit) and service.test.ts (integration, real PostgreSQL)
+scripts/load.mjs           load test (autocannon) + correctness checks
+scripts/check-invariants.sql   accounting invariants checked directly in the database
+client/                    example application (web page + small backend that holds the API key)
+docs/                      LOAD_TEST.md (analysis), load-results.json (raw results), demo screenshots
 ```
 
 ## Concepts
@@ -117,6 +131,7 @@ Plans are read inside each `/consume` transaction, so an edit applies to every r
 - **Idempotency in the database**, not in memory, so it survives restarts and works across instances.
 - **Usage counters are rows per (entity, month)**, not computed by summing history: O(1) decisions, and the account counter is updated atomically with the user counter. History (`requests`) is a separate append-only log used for the audit/history API and for cross-checking counters in tests.
 - **Auth**: SHA-256 of the key is looked up; valid keys are cached in memory for 60 s (keys are immutable in this version).
+- **Rules, accounting and HTTP are separate.** `rules.ts` is pure (decides from limits and consumed units), `services/consume.ts` owns the transaction and locking, `routes/` only validates input and shapes output. A new rule type means one more check in `evaluate()` plus unit tests, without touching SQL or HTTP code.
 - **Rejection is HTTP 200 with `accepted:false`**: it is a decision, not an error. Errors use 4xx/5xx.
 
 ## Product assumptions (brief left these open)
@@ -133,14 +148,15 @@ Plans are read inside each `/consume` transaction, so an edit applies to every r
 
 ## Tests
 
-Integration tests run against a real PostgreSQL (no mocks), via Fastify's in-process `inject`.
+35 automated tests: 11 unit tests for the pure rules and 24 integration tests against a real PostgreSQL (no mocks), using Fastify's in-process `inject`.
 
 ```bash
 docker compose up -d db
 npm install
 npm test            # DATABASE_URL defaults to postgres://quota:quota@localhost:5432/quota
 ```
-Covers: API-key validation, admin token, account isolation (usage, history, plans, users), all four rejection rules, rejection consumes nothing, shared-plan separate usage, input validation, idempotent replay + conflict, 20 parallel duplicate requests, 100 parallel requests never overspending, plan switch / lowering below usage / plan update affecting all users / history preserved, predefined plans read-only, UTC month rollover with an injected clock, pagination.
+- **`test/rules.test.ts`**: every rule and its boundary (exactly the remaining units is accepted, one more is rejected), which rule is reported first, allowance lowered below usage, `remaining` never negative.
+- **`test/service.test.ts`**: API-key validation (missing, invalid, only a hash is stored), admin token, account isolation (usage, history, plans, users), all four rejection rules over HTTP, a rejection consumes nothing, shared plan with separate usage, input validation, idempotent replay + 409 conflict, same `requestId` in two accounts is independent, 20 parallel duplicates of one request, 100 parallel requests never overspending (shared account), 30 parallel requests against a single user's allowance, plan switch / lowering below usage / plan update affecting all users / history preserved, predefined plans read-only, UTC month rollover with an injected clock, pagination, `/usage` listing, and finally `scripts/check-invariants.sql` returning zero violations.
 
 ## Performance testing
 
@@ -154,12 +170,18 @@ docker compose up -d --build
 npm install
 $env:ADMIN_TOKEN="dev-admin-token"; npm run load      # Windows PowerShell
 ```
-Uses `autocannon` (`scripts/load.mjs`). Scenarios: one hot account with 200 users, 50 accounts spread out, and a correctness run where limits are really hit and the final counters are checked against an independent re-sum of the request history. Results and analysis: [docs/LOAD_TEST.md](docs/LOAD_TEST.md). In short: a single hot account is limited by lock-hold time (~100 req/s on a Docker Desktop laptop), many accounts run ~4x faster, and under load the counters always matched the request history exactly (no overspend).
+Uses `autocannon` (`scripts/load.mjs`). The script saves the raw numbers and the machine description to `docs/load-results.json` (committed as evidence) and, when the database is reachable on `localhost:5432` (`DATABASE_URL` to override), runs `scripts/check-invariants.sql` directly against it: account counter = sum of its users = sum of its accepted requests, and every rejection has a reason. Run it by hand any time:
+```bash
+docker compose exec -T db psql -U quota -d quota < scripts/check-invariants.sql                       # bash
+Get-Content scripts/check-invariants.sql | docker compose exec -T db psql -U quota -d quota          # PowerShell
+```
+(no rows = all invariants hold). Scenarios: one hot account with 200 users, 50 accounts spread out, and a correctness run where limits are really hit and the final counters are checked against an independent re-sum of the request history. Results and analysis: [docs/LOAD_TEST.md](docs/LOAD_TEST.md). In short: a single hot account is limited by lock-hold time (~97 req/s on a Docker Desktop laptop), many accounts run ~5x faster (~520 req/s), and under load the counters always matched the request history exactly, with 0 violations in the database invariants check (no overspend).
 
 ## Known limitations
 
 - **Hot account row**: every accepted/rejected request for one account serializes on that account's `account_usage` row lock. Throughput per account is bounded by transaction latency; different accounts scale independently.
 - Single PostgreSQL, single region; no read replicas, no sharding.
+- Correctness relies on the database (row locks, transactions, the unique constraint), not on application memory, so it should also hold with several API instances, but I only tested one API process (with many concurrent database connections).
 - API keys cannot be rotated/revoked, and there is no way to delete accounts, users or plans.
 - Admin token is a single shared secret, not a role system.
 - `requests` grows forever (no retention/partitioning).
@@ -167,4 +189,4 @@ Uses `autocannon` (`scripts/load.mjs`). Scenarios: one hot account with 200 user
 
 ## Tracing a request (for the walkthrough)
 
-`POST /consume` → `auth()` (header → SHA-256 → account) → validation → `BEGIN` → load user+plans → claim `requestId` (replay / 409 if taken) → lock account usage row, then user usage row → decide → one write statement → `COMMIT` → response. Code: `src/app.ts`, route `/consume`. Schema: `db/init.sql`.
+`POST /consume` → `src/routes/consume.ts` (authenticate via `services/auth.ts`, validate input, compute the UTC month) → `src/services/consume.ts`: `BEGIN` → load user + both plans → claim `requestId` (replay the stored decision / 409 if already used) → lock the account usage row, then the user usage row → **`evaluate()` in `src/rules.ts`** decides → one write statement → `COMMIT` → response. Schema: `db/init.sql`.
