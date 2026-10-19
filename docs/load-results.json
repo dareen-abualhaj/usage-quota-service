@@ -1,0 +1,74 @@
+{
+  "date": "2026-10-19T07:10:28.567Z",
+  "environment": {
+    "platform": "win32",
+    "cpuModel": "11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz",
+    "cpus": 8,
+    "memGB": 15,
+    "node": "v24.18.0"
+  },
+  "settings": {
+    "connections": 64,
+    "durationSecPerScenario": 10,
+    "limitScenarioRequests": 3000
+  },
+  "results": [
+    {
+      "title": "1 account / 200 users",
+      "connections": 64,
+      "durationSec": 10,
+      "reqPerSec": 97,
+      "p50ms": 492,
+      "p97_5ms": 1554,
+      "p99ms": 1991,
+      "maxMs": 2695,
+      "totalRequests": 966,
+      "non2xx": 0,
+      "errors": 0,
+      "timeouts": 0
+    },
+    {
+      "title": "50 accounts / 20 users each",
+      "connections": 64,
+      "durationSec": 10,
+      "reqPerSec": 520,
+      "p50ms": 115,
+      "p97_5ms": 170,
+      "p99ms": 340,
+      "maxMs": 633,
+      "totalRequests": 5199,
+      "non2xx": 0,
+      "errors": 0,
+      "timeouts": 0
+    },
+    {
+      "title": "limit correctness (allowance 1000)",
+      "connections": 64,
+      "durationSec": 32,
+      "reqPerSec": 94,
+      "p50ms": 466,
+      "p97_5ms": 2043,
+      "p99ms": 3296,
+      "maxMs": 5207,
+      "totalRequests": 3000,
+      "non2xx": 0,
+      "errors": 0,
+      "timeouts": 0
+    }
+  ],
+  "correctness": {
+    "requestsRecorded": 3000,
+    "rejected": 2000,
+    "acceptedUnitsFromHistory": 1000,
+    "accountConsumed": 1000,
+    "accountAllowance": 1000,
+    "sumOfUserConsumed": 1000,
+    "maxUserConsumed": 59,
+    "userAllowance": 80,
+    "ok": true
+  },
+  "dbInvariants": {
+    "checked": true,
+    "violations": 0
+  }
+}
