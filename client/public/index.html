@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Quota demo client</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:system-ui,sans-serif;max-width:980px;margin:24px auto;padding:0 16px;color:#222}
+  button{padding:8px 12px;margin:2px;cursor:pointer} fieldset{margin:12px 0;border:1px solid #ccc;border-radius:8px}
+  table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:6px 8px;text-align:left}
+  th{background:#f5f5f5} .ok{color:#0a7d2c;font-weight:600} .no{color:#b00020;font-weight:600}
+  pre{background:#f7f7f7;padding:10px;border-radius:6px;overflow:auto;max-height:340px;font-size:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style></head><body>
+<h1>Document processing app (quota demo)</h1>
+<p>This page talks to a small backend that holds the account API key and calls the quota service.</p>
+<div class="row">
+  <button onclick="post('/api/setup').then(render)">1. Setup demo account</button>
+  <button onclick="runDemo()"><b>2. Run scripted demo</b></button>
+</div>
+
+<fieldset><legend>Process a document</legend><div class="row">
+  User <select id="u"><option>alice</option><option>bob</option></select>
+  Units <input id="n" type="number" min="1" value="5" style="width:80px">
+  <button onclick="consume()">Process</button>
+</div></fieldset>
+
+<fieldset><legend>Change plans (no client change, no redeploy)</legend><div class="row">
+  <select id="pu"><option>alice</option><option>bob</option></select> to
+  <select id="pp"><option>Basic</option><option>Premium</option></select>
+  <button onclick="userPlan()">Switch user plan</button>
+  &nbsp;|&nbsp; Account plan: monthly <input id="am" type="number" value="120" style="width:80px">
+  per request <input id="ar" type="number" value="100" style="width:70px">
+  <button onclick="accountPlan()">Update</button>
+</div></fieldset>
+
+<h3>Current usage</h3><div id="state">Click “Setup demo account”.</div>
+<h3>Decisions</h3><div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+async function post(path, body){ const r = await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body||{})}); return r.json(); }
+const row = (n,s,plan) => `<tr><td>${n}</td><td>${s.plan.name}</td><td>${s.consumed}</td><td><b>${s.remaining}</b></td><td>${s.monthlyAllowance}</td><td>${s.maxPerRequest}</td></tr>`;
+function render(st){
+  if(!st||!st.usage){ $('state').textContent = JSON.stringify(st); return; }
+  $('state').innerHTML = `<table><tr><th>Who</th><th>Plan</th><th>Consumed</th><th>Remaining</th><th>Monthly</th><th>Per request</th></tr>
+    ${row('ACCOUNT (shared) ' + st.usage.month, st.usage.account)}${st.usage.users.map(u=>row(u.userId,u)).join('')}</table>`;
+}
+function entry(title, status, r){
+  let verdict = '';
+  if (r && r.accepted !== undefined) verdict = r.accepted
+    ? `<span class="ok">ACCEPTED</span> (user remaining ${r.user.remaining}, account remaining ${r.account.remaining})`
+    : `<span class="no">REJECTED</span> by <b>${r.rejection.scope}</b> / ${r.rejection.rule} — ${r.rejection.message} (user remaining ${r.user.remaining}, account remaining ${r.account.remaining})`;
+  $('log').insertAdjacentHTML('afterbegin', `<div><b>${title}</b> [${status}]<br>${verdict}<details><summary>raw</summary><pre>${JSON.stringify(r,null,2)}</pre></details></div><hr>`);
+}
+async function refresh(){ const r = await fetch('/api/state'); render(await r.json()); }
+async function runDemo(){ $('log').innerHTML='Running…'; const d = await post('/api/demo'); $('log').innerHTML=''; d.log.slice().reverse().forEach(s=>entry(s.title,s.status,s.result)); render(d.state); }
+async function consume(){ const r = await post('/api/consume',{userId:$('u').value,units:$('n').value}); entry(`${$('u').value} processes ${$('n').value} units`, r.status, r.body); refresh(); }
+async function userPlan(){ const r = await post('/api/user-plan',{userId:$('pu').value,plan:$('pp').value}); entry(`switch ${$('pu').value} -> ${$('pp').value}`, r.status, r.body); refresh(); }
+async function accountPlan(){ const r = await post('/api/account-plan',{monthlyAllowance:$('am').value,maxPerRequest:$('ar').value}); entry('update account plan', r.status, r.body); refresh(); }
+</script></body></html>

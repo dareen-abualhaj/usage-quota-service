@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: quota
+      POSTGRES_PASSWORD: quota
+      POSTGRES_DB: quota
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"            # exposed so `npm test` / `npm run load` can run from the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quota -d quota"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  service:
+    build: .
+    environment:
+      DATABASE_URL: postgres://quota:quota@db:5432/quota
+      ADMIN_TOKEN: dev-admin-token      # required to create accounts (POST /accounts)
+      PORT: "3000"
+      LOG_LEVEL: warn
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  client:
+    build: ./client
+    environment:
+      SERVICE_URL: http://service:3000
+      ADMIN_TOKEN: dev-admin-token
+    depends_on:
+      service:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
