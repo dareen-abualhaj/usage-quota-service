@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { Pool } from 'pg';
 import { buildApp } from '../src/app';
 import { createPool, migrate } from '../src/db';
@@ -217,5 +219,56 @@ describe('months & history', () => {
     const p3 = (await call('GET', `/requests?limit=2&cursor=${p2.nextCursor}`, key)).body;
     expect(p3.items.map((i: any) => i.requestId)).toEqual(['p-0']);
     expect(p3.nextCursor).toBeNull();
+  });
+});
+
+
+describe('keys, request ids, single-user concurrency, usage listing, DB invariants', () => {
+  it('stores only a SHA-256 hash of the API key, never the key', async () => {
+    const created = await call('POST', '/accounts', undefined, { name: 'hash-check' });
+    const key = created.body.apiKey as string;
+    expect((await pool.query('SELECT 1 FROM accounts WHERE api_key_hash = $1', [key])).rowCount).toBe(0);
+    const row = (await pool.query('SELECT api_key_hash FROM accounts WHERE id = $1', [created.body.account.id])).rows[0];
+    expect(row.api_key_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(row.api_key_hash).not.toContain(key);
+  });
+
+  it('the same requestId in two different accounts is independent', async () => {
+    const A = await mk([100, 10], { u: [100, 10] });
+    const B = await mk([100, 10], { u: [100, 10] });
+    const a = await consume(A.key, 'u', 5, 'shared-id');
+    const b = await consume(B.key, 'u', 7, 'shared-id'); // different units: NOT a conflict, different account
+    expect(a.body.accepted).toBe(true); expect(a.body.replayed).toBe(false);
+    expect(b.status).toBe(200); expect(b.body.accepted).toBe(true); expect(b.body.replayed).toBe(false);
+    expect((await call('GET', '/usage', A.key)).body.account.consumed).toBe(5);
+    expect((await call('GET', '/usage', B.key)).body.account.consumed).toBe(7);
+  });
+
+  it('30 parallel requests against a user with allowance 20 accept exactly 20', async () => {
+    const { key } = await mk([1000, 10], { solo: [20, 10] });
+    const rs = await Promise.all(Array.from({ length: 30 }, () => consume(key, 'solo', 1)));
+    expect(rs.filter((r) => r.body.accepted)).toHaveLength(20);
+    const rejected = rs.filter((r) => !r.body.accepted);
+    expect(rejected).toHaveLength(10);
+    expect(rejected.every((r) => r.body.rejection.scope === 'user' && r.body.rejection.rule === 'monthly_allowance')).toBe(true);
+    const u = (await call('GET', '/users/solo/usage', key)).body;
+    expect(u.user.consumed).toBe(20); expect(u.user.remaining).toBe(0); expect(u.account.consumed).toBe(20);
+  });
+
+  it('GET /usage lists the account and every user with consumed and remaining', async () => {
+    const { key } = await mk([1000, 100], { a: [100, 10], b: [50, 10] });
+    await consume(key, 'a', 7); await consume(key, 'b', 3);
+    const u = (await call('GET', '/usage', key)).body;
+    expect(u.account).toMatchObject({ consumed: 10, remaining: 990, monthlyAllowance: 1000, maxPerRequest: 100 });
+    const byId = Object.fromEntries(u.users.map((x: any) => [x.userId, x]));
+    expect(byId.a).toMatchObject({ consumed: 7, remaining: 93, monthlyAllowance: 100, maxPerRequest: 10 });
+    expect(byId.b).toMatchObject({ consumed: 3, remaining: 47, monthlyAllowance: 50, maxPerRequest: 10 });
+    expect(byId.a.plan.name).toBe('P-a');
+  });
+
+  it('DB invariants hold after everything above (scripts/check-invariants.sql returns zero rows)', async () => {
+    const sql = readFileSync(path.join(__dirname, '..', 'scripts', 'check-invariants.sql'), 'utf8');
+    const violations = await pool.query(sql);
+    expect(violations.rows).toEqual([]);
   });
 });
