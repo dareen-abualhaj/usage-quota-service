@@ -1,6 +1,13 @@
 // Load test: node scripts/load.mjs   (env: BASE_URL, ADMIN_TOKEN, DURATION, CONNECTIONS)
 import autocannon from 'autocannon';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
 const ADMIN = process.env.ADMIN_TOKEN ?? '';
@@ -97,4 +104,31 @@ results.push(r3);
 console.log('\n================ RESULTS ================');
 console.table(results.map(({ check, ...r }) => r));
 console.log('Correctness check (scenario 3):', JSON.stringify(r3.check));
-if (!r3.check.ok) { console.error('CORRECTNESS FAILURE'); process.exit(1); }
+
+// Independent check straight in the database (see scripts/check-invariants.sql). Zero violations expected.
+let invariants = { checked: false, violations: null };
+try {
+  const client = new pg.Client({ connectionString: process.env.DATABASE_URL ?? 'postgres://quota:quota@localhost:5432/quota' });
+  await client.connect();
+  const v = await client.query(fs.readFileSync(path.join(here, 'check-invariants.sql'), 'utf8'));
+  await client.end();
+  invariants = { checked: true, violations: v.rows.length };
+  console.log('DB invariants:', v.rows.length === 0 ? 'OK (0 violations)' : JSON.stringify(v.rows.slice(0, 5)));
+} catch (e) {
+  console.log('DB invariants NOT checked (database not reachable from here):', e.message);
+}
+
+// Save the raw results so they can be committed as evidence.
+const out = {
+  date: new Date().toISOString(),
+  environment: { platform: os.platform(), cpuModel: os.cpus()[0]?.model, cpus: os.cpus().length, memGB: Math.round(os.totalmem() / 2 ** 30), node: process.version },
+  settings: { connections: CONNECTIONS, durationSecPerScenario: DURATION, limitScenarioRequests: 3000 },
+  results: results.map(({ check, ...r }) => r),
+  correctness: r3.check,
+  dbInvariants: invariants,
+};
+fs.mkdirSync(path.join(here, '..', 'docs'), { recursive: true });
+fs.writeFileSync(path.join(here, '..', 'docs', 'load-results.json'), JSON.stringify(out, null, 2) + '\n');
+console.log('Saved docs/load-results.json');
+
+if (!r3.check.ok || (invariants.checked && invariants.violations > 0)) { console.error('CORRECTNESS FAILURE'); process.exit(1); }
