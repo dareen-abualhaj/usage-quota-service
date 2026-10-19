@@ -32,11 +32,11 @@ async function makeAccount(name, nUsers, acct, user) {
   return { apiKey, users };
 }
 
-function run(title, accounts) {
+function run(title, accounts, opts = {}) {
   return new Promise((resolve, reject) => {
     const pick = (a) => a[Math.floor(Math.random() * a.length)];
     const inst = autocannon({
-      url: BASE, connections: CONNECTIONS, duration: DURATION,
+      url: BASE, connections: CONNECTIONS, ...(opts.amount ? { amount: opts.amount } : { duration: DURATION }),
       requests: [{
         method: 'POST', path: '/consume',
         setupRequest: (req) => {
@@ -49,7 +49,7 @@ function run(title, accounts) {
     }, (err, r) => {
       if (err) return reject(err);
       resolve({
-        title, connections: CONNECTIONS, durationSec: DURATION,
+        title, connections: CONNECTIONS, durationSec: Math.round(r.duration),
         reqPerSec: Math.round(r.requests.average), p50ms: r.latency.p50, p97_5ms: r.latency.p97_5, p99ms: r.latency.p99, maxMs: r.latency.max,
         totalRequests: r.requests.total, non2xx: r.non2xx, errors: r.errors, timeouts: r.timeouts,
       });
@@ -72,7 +72,10 @@ results.push(await run('50 accounts / 20 users each', many));
 
 console.log('\n== Scenario 3: correctness under load: account allowance 1000, 20 users x 80 (limits ARE hit) ==');
 const lim = await makeAccount('load-limit', 20, [1000, 10], [80, 10]);
-const r3 = await run('limit correctness (allowance 1000)', [lim]);
+// Fixed request count (not a duration): guarantees the allowance is exceeded on any machine,
+// and autocannon only returns once every response arrived, so nothing is still in flight when we verify.
+const r3 = await run('limit correctness (allowance 1000)', [lim], { amount: 3000 });
+await new Promise((r) => setTimeout(r, 1000));
 const usage = await api('GET', '/usage', lim.apiKey);
 const sumUsers = usage.users.reduce((s, u) => s + u.consumed, 0);
 const maxUser = Math.max(...usage.users.map((u) => u.consumed));
